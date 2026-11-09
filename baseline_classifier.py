@@ -19,6 +19,7 @@ from typing import Any
 
 import joblib
 import pandas as pd
+from data_utils import load_training, load_test, validate_paths
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
@@ -126,11 +127,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    train = pd.read_excel(args.input, usecols=["resp_text", "clarity"])
-    train = train.dropna(subset=["resp_text", "clarity"]).copy()
-    texts = train["resp_text"].fillna("").astype(str)
-    labels = train["clarity"].astype(str)
-    groups = normalized_groups(texts)
+    validate_paths(args.input, args.test, args.output)
+    load_test(args.test)  # Falha antes de iniciar a busca se a entrada for inválida.
+    texts, labels, groups = load_training(args.input)
 
     # 2 x 3 x 3 x 4 = 72 configurações, avaliadas em cinco folds.
     param_grid = {
@@ -152,12 +151,12 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("MELHOR MODELO ENCONTRADO")
     print("=" * 70)
-    print(f"Accuracy média OOF: {result.best_score_:.2%}")
+    print(f"Acurácia média de seleção CV: {result.best_score_:.2%}")
     print("Hiperparâmetros:", result.best_params_)
 
     # refit=True já treinou o vencedor usando todas as linhas do treino.
     best_model = result.best_estimator_
-    test = pd.read_excel(args.test)
+    test = load_test(args.test)
     if "resp_text" not in test.columns or "clarity" not in test.columns:
         raise ValueError("O teste precisa conter as colunas resp_text e clarity.")
     if test["clarity"].notna().any():
@@ -171,11 +170,12 @@ def main() -> None:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     test.to_excel(args.output, index=False)
+    pd.DataFrame(result.cv_results_).to_csv(args.output.with_suffix(".cv.csv"), index=False)
     joblib.dump(best_model, args.output.with_suffix(".joblib"))
     args.output.with_suffix(".json").write_text(
         json.dumps(
             {
-                "oof_accuracy": float(result.best_score_),
+                "selection_cv_accuracy": float(result.best_score_),
                 "best_params": result.best_params_,
                 "classes": sorted(labels.unique().tolist()),
                 "rows_predicted": int(len(test)),

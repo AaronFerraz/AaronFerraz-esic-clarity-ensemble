@@ -1,0 +1,14 @@
+# Instale a distribuição CPU/CUDA de torch adequada ao hardware.
+numpy>=1.26,<3
+pandas>=2.2,<4
+scipy>=1.12,<2
+scikit-learn>=1.6,<2
+joblib>=1.4,<2
+openpyxl>=3.1,<4
+torch>=2.2,<3
+transformers>=4.51,<5
+datasets>=3,<5
+accelerate>=1,<2
+matplotlib>=3.8,<4
+ipython>=8,<10
+ipykernel>=6,<8

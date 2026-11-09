@@ -17,6 +17,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from data_utils import load_training, load_test, validate_paths
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold
@@ -106,22 +107,8 @@ def with_model_grid(
     return [{**profile, **model_grid} for profile in feature_profiles]
 
 
-def load_data(path: Path) -> tuple[pd.Series, pd.Series, pd.Series]:
-    frame = pd.read_excel(path)
-    required = {"resp_text", "clarity"}
-    if missing := required - set(frame.columns):
-        raise ValueError(f"Colunas ausentes: {sorted(missing)}")
-
-    frame = frame.dropna(subset=["resp_text", "clarity"]).copy()
-    texts = frame["resp_text"].astype(str)
-    labels = frame["clarity"].astype(str)
-    groups = (
-        texts.str.normalize("NFKC")
-        .str.lower()
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
-    return texts, labels, groups
+def load_data(path: Path):
+    return load_training(path)
 
 
 def candidates() -> list[tuple[str, Pipeline, dict[str, list[object]] | list[dict[str, list[object]]]]]:
@@ -200,7 +187,7 @@ def candidates() -> list[tuple[str, Pipeline, dict[str, list[object]] | list[dic
 
 def export_test_predictions(model: Pipeline, test_path: Path, output_dir: Path) -> Path:
     """Gera a planilha de entrega sem modificar a planilha de teste original."""
-    test = pd.read_excel(test_path)
+    test = load_test(test_path)
     required = {"resp_text", "clarity"}
     if missing := required - set(test.columns):
         raise ValueError(f"Colunas ausentes no teste: {sorted(missing)}")
@@ -223,6 +210,8 @@ def main() -> None:
         help="Use 1 no Windows para LinearSVC; paralelismo pode esgotar RAM.",
     )
     args = parser.parse_args()
+    validate_paths(args.input, args.test, args.output / "test1_rotulado.xlsx")
+    load_test(args.test)
     args.output.mkdir(parents=True, exist_ok=True)
 
     texts, labels, groups = load_data(args.input)
@@ -246,6 +235,9 @@ def main() -> None:
             verbose=1,
         )
         search.fit(texts, labels, groups=groups)
+        pd.DataFrame(search.cv_results_).to_csv(
+            args.output / f"cv_results_{len(results)+1}.csv", index=False
+        )
         result = {
             "model": name,
             "mean_accuracy": float(search.best_score_),

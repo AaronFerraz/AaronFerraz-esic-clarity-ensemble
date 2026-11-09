@@ -1,8 +1,8 @@
-"""
+r"""
 Fine-tuning leakage-aware do BERTimbau para train.xlsx.
 
 Execução:
-python bertimbau_gridsearch.py --input "Dataset\train.xlsx" --test "Dataset\test1.xlsx" --output ".\modelo_bertimbau"
+python bertimbau_classifier.py --input "Dataset\train.xlsx" --test "Dataset\test1.xlsx" --output ".\modelo_bertimbau"
 
 Requisitos:
 - pip install torch transformers datasets accelerate scikit-learn pandas openpyxl
@@ -26,6 +26,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
+from data_utils import load_training, load_test, validate_paths
 import torch
 from datasets import Dataset
 from sklearn.base import BaseEstimator, ClassifierMixin
@@ -90,6 +91,7 @@ def execute_grid_search(
         cv=cv,
         n_jobs=1,
         refit=True,
+        error_score="raise",
         return_train_score=False,
         verbose=2,
     )
@@ -174,17 +176,22 @@ class BertimbauClassifier(ClassifierMixin, BaseEstimator):
         return Dataset.from_dict(all_encoded), document_index
 
     def fit(self, texts: Any, labels: Any) -> "BertimbauClassifier":
-        if not 1 <= self.stride < self.max_length <= 512:
+        if not 0 < self.stride < self.max_length - 2 <= 510:
             raise ValueError("Use 0 < stride < max_length <= 512.")
 
+        if min(self.batch_size, self.num_train_epochs, self.gradient_accumulation_steps, self.tokenizer_batch_size) < 1:
+            raise ValueError("Épocas e tamanhos de lote devem ser positivos.")
+        if len(texts) != len(labels) or not len(texts):
+            raise ValueError("Textos e rótulos vazios ou incompatíveis.")
         set_seed(self.random_state)
         has_cuda = torch.cuda.is_available()
         use_bf16 = has_cuda and torch.cuda.is_bf16_supported()
+        use_tf32 = has_cuda and torch.cuda.get_device_capability(0)[0] >= 8
         if has_cuda:
             # TF32 usa Tensor Cores nas GPUs NVIDIA Ampere ou posteriores sem
             # reduzir a estabilidade numérica materialmente neste fine-tuning.
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cuda.matmul.allow_tf32 = use_tf32
+            torch.backends.cudnn.allow_tf32 = use_tf32
             torch.cuda.empty_cache()
         text_list = self._as_text_list(texts)
         self.classes_ = np.unique(np.asarray(labels))
@@ -233,7 +240,7 @@ class BertimbauClassifier(ClassifierMixin, BaseEstimator):
             "report_to": "none",
             "bf16": use_bf16,
             "fp16": has_cuda and not use_bf16,
-            "tf32": has_cuda,
+            "tf32": use_tf32,
             "optim": "adamw_torch_fused" if has_cuda else "adamw_torch",
             "dataloader_num_workers": self.dataloader_num_workers,
             "dataloader_pin_memory": has_cuda,
@@ -254,6 +261,10 @@ class BertimbauClassifier(ClassifierMixin, BaseEstimator):
             "data_collator": DataCollatorWithPadding(tokenizer=self.tokenizer_),
         }
         trainer_supported = set(inspect.signature(Trainer.__init__).parameters)
+        if "processing_class" in trainer_supported:
+            trainer_options.pop("tokenizer", None)
+        else:
+            trainer_options.pop("processing_class", None)
         self.trainer_ = Trainer(**{
             key: value for key, value in trainer_options.items()
             if key in trainer_supported
@@ -266,6 +277,8 @@ class BertimbauClassifier(ClassifierMixin, BaseEstimator):
             raise RuntimeError("Chame fit antes de predict_proba.")
 
         text_list = self._as_text_list(texts)
+        if not text_list:
+            return np.empty((0, len(self.classes_)))
         dataset, document_index = self._tokenize(text_list)
         logits = self.trainer_.predict(dataset).predictions
 
@@ -288,23 +301,8 @@ class BertimbauClassifier(ClassifierMixin, BaseEstimator):
         return self.classes_[np.argmax(probabilities, axis=1)]
 
 
-def load_data(path: Path) -> tuple[pd.Series, pd.Series, pd.Series]:
-    frame = pd.read_excel(path)
-    required_columns = {"resp_text", "clarity"}
-    missing = required_columns - set(frame.columns)
-    if missing:
-        raise ValueError(f"Colunas ausentes: {sorted(missing)}")
-
-    frame = frame.dropna(subset=["resp_text", "clarity"]).copy()
-    texts = frame["resp_text"].astype(str)
-    labels = frame["clarity"].astype(str)
-    groups = (
-        texts.str.normalize("NFKC")
-        .str.lower()
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
-    return texts, labels, groups
+def load_data(path: Path):
+    return load_training(path)
 
 
 def export_test_predictions(
@@ -313,7 +311,7 @@ def export_test_predictions(
     output_path: Path,
 ) -> Path:
     """Prediz o teste e preserva todas as suas colunas na planilha de saída."""
-    test = pd.read_excel(test_path)
+    test = load_test(test_path)
     required_columns = {"resp_text", "clarity"}
     missing = required_columns - set(test.columns)
     if missing:
@@ -351,6 +349,8 @@ def main() -> None:
         help="Processos de preparação de lotes pela CPU.",
     )
     args = parser.parse_args()
+    validate_paths(args.input, args.test, args.output / "test1_rotulado.xlsx")
+    load_test(args.test)
 
     if not torch.cuda.is_available():
         print("AVISO: nenhuma GPU CUDA detectada; o treinamento será lento.")
@@ -384,6 +384,7 @@ def main() -> None:
     )
 
     # GridSearchCV refaz automaticamente o melhor modelo com todos os dados.
+    pd.DataFrame(search.cv_results_).to_csv(args.output / "cv_results.csv", index=False)
     best_model = search.best_estimator_
     best_model.model_.save_pretrained(args.output / "model")
     best_model.tokenizer_.save_pretrained(args.output / "model")
